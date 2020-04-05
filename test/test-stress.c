@@ -252,6 +252,9 @@ int main(int argc, char** argv) {
   // mi_collect(true);
   mi_stats_print(NULL);
   //bench_end_program();
+  fprintf(stderr, "press any key to exit...");
+  char c;
+  scanf("%c", &c);
   return 0;
 }
 

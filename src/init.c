@@ -10,9 +10,20 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // atexit
 
+mi_decl_export void* df_heap_start;
+mi_decl_export void* df_shadow_start;
+
+mi_memfd_t _df_memfd; // = 0
+mi_shadow_start_t _df_shadow_start; // = 0
+bool _mi_os_create_memfd(mi_memfd_t* _mi_memfd);
+void _mi_os_close_memfd(mi_memfd_t* _mi_memfd);
+void* _mi_os_reserve_shadow();
+void _mi_os_delete_shadow(void* ptr);
+
 // Empty page used to initialize the small free pages array
 const mi_page_t _mi_page_empty = {
   0, false, false, false, false,
+  0,       // tag
   0,       // capacity
   0,       // reserved capacity
   { 0 },   // flags
@@ -30,6 +41,12 @@ const mi_page_t _mi_page_empty = {
   NULL, NULL
 };
 
+mi_rage_start_t _df_range_start = 0;
+// os.c
+uintptr_t _mi_os_reserve_df_range();
+bool _mi_os_delete_df_range(uintptr_t ptr);
+
+
 #define MI_PAGE_EMPTY() ((mi_page_t*)&_mi_page_empty)
 
 #if defined(MI_PADDING) && (MI_INTPTR_SIZE >= 8)
@@ -37,7 +54,7 @@ const mi_page_t _mi_page_empty = {
 #elif defined(MI_PADDING)
 #define MI_SMALL_PAGES_EMPTY  { MI_INIT128(MI_PAGE_EMPTY), MI_PAGE_EMPTY(), MI_PAGE_EMPTY(), MI_PAGE_EMPTY() }
 #else
-#define MI_SMALL_PAGES_EMPTY  { MI_INIT128(MI_PAGE_EMPTY), MI_PAGE_EMPTY() }
+#define MI_SMALL_PAGES_EMPTY  { MI_INIT128(MI_PAGE_EMPTY), MI_PAGE_EMPTY(), MI_PAGE_EMPTY() }
 #endif
 
 
@@ -147,6 +164,52 @@ static void mi_heap_main_init(void) {
     _mi_random_init(&_mi_heap_main.random);
     _mi_heap_main.keys[0] = _mi_heap_random_next(&_mi_heap_main);
     _mi_heap_main.keys[1] = _mi_heap_random_next(&_mi_heap_main);
+  }
+
+  // allocate memfd
+  mi_memfd_t mi_memfd;
+  mi_memfd.value = mi_atomic_read_relaxed(&_df_memfd.value);
+  if (!mi_memfd.x.is_init) {
+    mi_memfd_t new_fd;
+    bool success = _mi_os_create_memfd(&new_fd);
+    mi_assert_internal(success);
+    if (success) {
+      if (!mi_atomic_cas_strong(&_df_memfd.value, new_fd.value, mi_memfd.value)) {
+        // somebody else updated the fd before us, just close this one
+        // and we should be fine
+        _mi_os_close_memfd(&new_fd);
+      }
+    }
+  }
+  mi_memfd.value = mi_atomic_read_relaxed(&_df_memfd.value);
+  mi_assert_internal(mi_memfd.x.is_init);
+
+  // TODO does it really make sense to split the initialization?
+  // reserve range for all mappings
+  if (mi_atomic_read_relaxed(&_df_range_start) == 0) {
+    uintptr_t range = _mi_os_reserve_df_range();
+    if (range) {
+      if (!mi_atomic_cas_strong(&_df_range_start, range, 0)) {
+        // somebody else updated the range before us, just delete this one
+        // and we should be fine
+        _mi_os_delete_df_range(range);
+      }
+      else {
+        df_heap_start = (void*)range;
+      }
+    }
+  }
+
+  if (mi_atomic_read_relaxed(&_df_shadow_start) == 0) {
+    void* shadow = _mi_os_reserve_shadow();
+    if (shadow) {
+      if (!mi_atomic_cas_strong(&_df_shadow_start, (uintptr_t)shadow, 0)) {
+        _mi_os_delete_shadow(shadow);
+      }
+      else {
+        df_shadow_start = (void*)shadow;
+      }
+    }
   }
 }
 
@@ -467,11 +530,6 @@ void mi_process_init(void) mi_attr_noexcept {
   _mi_verbose_message("secure level: %d\n", MI_SECURE);
   mi_thread_init();
   mi_stats_reset();  // only call stat reset *after* thread init (or the heap tld == NULL)
-
-  if (mi_option_is_enabled(mi_option_reserve_huge_os_pages)) {
-    size_t pages = mi_option_get(mi_option_reserve_huge_os_pages);
-    mi_reserve_huge_os_pages_interleave(pages, 0, pages*500);
-  }
 }
 
 // Called when the process is done (through `at_exit`)
@@ -493,6 +551,18 @@ static void mi_process_done(void) {
   mi_allocator_done();
   _mi_verbose_message("process done: 0x%zx\n", _mi_heap_main.thread_id);
   os_preloading = true; // don't call the C runtime anymore
+
+  // clear memfd
+  mi_memfd_t mi_memfd;
+  mi_memfd.value = mi_atomic_read_relaxed(&_df_memfd.value);
+  if (mi_memfd.x.is_init) {
+    mi_memfd_t new_fd;
+    new_fd.x.is_init = false;
+    if (mi_atomic_cas_strong(&_df_memfd.value, new_fd.value, mi_memfd.value)) {
+      // we are responsible for closing
+      _mi_os_close_memfd(&mi_memfd);
+    }
+  }
 }
 
 

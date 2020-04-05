@@ -5,6 +5,7 @@ terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
 -----------------------------------------------------------------------------*/
 #define _DEFAULT_SOURCE
+#define _GNU_SOURCE
 
 #include "mimalloc.h"
 #include "mimalloc-internal.h"
@@ -16,7 +17,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "stats.c"
 #include "random.c"
 #include "os.c"
-#include "arena.c"
 #include "region.c"
 #include "segment.c"
 #include "page.c"

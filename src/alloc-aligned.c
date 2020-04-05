@@ -37,6 +37,7 @@ static void* mi_heap_malloc_zero_aligned_at(mi_heap_t* const heap, const size_t 
       mi_assert_internal(p != NULL);
       mi_assert_internal(((uintptr_t)p + offset) % alignment == 0);
       if (zero) _mi_block_zero_init(page,p,size);
+      p = _mi_df_new_allocation(p, _mi_align_up(mi_usable_size(p), DF_TAG_GRANULARITY));
       return p;
     }
   }
@@ -58,7 +59,12 @@ static void* mi_heap_malloc_zero_aligned_at(mi_heap_t* const heap, const size_t 
   void* aligned_p = (adjust == alignment ? p : (void*)((uintptr_t)p + adjust));
   if (aligned_p != p) mi_page_set_has_aligned(_mi_ptr_page(p), true); 
   mi_assert_internal(((uintptr_t)aligned_p + offset) % alignment == 0);
-  mi_assert_internal( p == _mi_page_ptr_unalign(_mi_ptr_segment(aligned_p),_mi_ptr_page(aligned_p),aligned_p) );
+  mi_assert_internal( _mi_df_ptr_mask_tag(p) ==
+                      _mi_page_ptr_unalign(_mi_ptr_segment(_mi_df_ptr_mask_tag(aligned_p)),
+                                           _mi_ptr_page(_mi_df_ptr_mask_tag(aligned_p)),
+                                           _mi_df_ptr_mask_tag(aligned_p)
+                                          )
+                    );
   return aligned_p;
 }
 
@@ -141,7 +147,8 @@ static void* mi_heap_realloc_zero_aligned_at(mi_heap_t* heap, void* p, size_t ne
       memcpy(newp, p, (newsize > size ? size : newsize));
       mi_free(p); // only free if successful
     }
-    return newp;
+    return _mi_df_new_allocation(newp, _mi_align_up(mi_usable_size(newp), DF_TAG_GRANULARITY));
+    //return _mi_df_new_allocation(newp, mi_usable_size(newp));
   }
 }
 

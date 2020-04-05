@@ -191,6 +191,12 @@ static void _mi_page_thread_free_collect(mi_page_t* page)
 void _mi_page_free_collect(mi_page_t* page, bool force) {
   mi_assert_internal(page!=NULL);
 
+  static mi_heap_t* _mi_heap_main = NULL;
+  if (_mi_heap_main == NULL) {
+    _mi_heap_main = _mi_heap_main_get();
+  }
+  page->df_tag = (uint8_t)(_mi_random_next(&_mi_heap_main->random) & ((1 << DF_MTAG_BITS)- 1));
+
   // collect the thread free list
   if (force || mi_page_thread_free(page) != NULL) {  // quick test to avoid an atomic operation
     _mi_page_thread_free_collect(page);
@@ -597,6 +603,7 @@ static void mi_page_extend_free(mi_heap_t* heap, mi_page_t* page, mi_tld_t* tld)
 
 // Initialize a fresh page
 static void mi_page_init(mi_heap_t* heap, mi_page_t* page, size_t block_size, mi_tld_t* tld) {
+
   mi_assert(page != NULL);
   mi_segment_t* segment = _mi_page_segment(page);
   mi_assert(segment != NULL);
@@ -613,6 +620,7 @@ static void mi_page_init(mi_heap_t* heap, mi_page_t* page, size_t block_size, mi
   page->keys[1] = _mi_heap_random_next(heap);
   #endif
   page->is_zero = page->is_zero_init;
+  page->df_tag = (uint8_t)(_mi_random_next(&heap->random) & ((1 << DF_MTAG_BITS)- 1));
 
   mi_assert_internal(page->capacity == 0);
   mi_assert_internal(page->free == NULL);

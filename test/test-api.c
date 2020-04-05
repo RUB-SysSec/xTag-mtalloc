@@ -82,6 +82,10 @@ int main() {
   CHECK_BODY("malloc-zero",{
     void* p = mi_malloc(0); mi_free(p);
   });
+  CHECK_BODY("malloc-large",{
+    void* p = mi_malloc(1<<30); mi_free(p);
+    result = (p != NULL);
+  });
   CHECK_BODY("malloc-nomem1",{
     result = (mi_malloc(SIZE_MAX/2) == NULL);
   });
@@ -93,7 +97,7 @@ int main() {
     result = (mi_calloc((size_t)&mi_calloc,SIZE_MAX/1000) == NULL);
   });
   CHECK_BODY("calloc0",{
-    result = (mi_usable_size(mi_calloc(0,1000)) <= 16);
+    result = (mi_usable_size(mi_calloc(0,1000)) <= 32);
   });
 
   // ---------------------------------------------------
@@ -194,6 +198,9 @@ int main() {
   fprintf(stderr,"\n\n---------------------------------------------\n"
                  "succeeded: %i\n"
                  "failed   : %i\n\n", ok, failed);
+  fprintf(stderr, "press any key to exit...");
+  char c;
+  scanf("%c", &c);
   return failed;
 }
 

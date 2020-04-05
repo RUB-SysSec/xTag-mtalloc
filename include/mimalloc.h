@@ -86,10 +86,14 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <stddef.h>     // size_t
 #include <stdbool.h>    // bool
+#include <stdint.h>     // uintptr_t
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+mi_decl_export extern void* df_heap_start;
+mi_decl_export extern void* df_shadow_start;
 
 // ------------------------------------------------------
 // Standard malloc interface
@@ -122,6 +126,7 @@ mi_decl_nodiscard mi_decl_export void* mi_reallocf(void* p, size_t newsize)     
 mi_decl_nodiscard mi_decl_export size_t mi_usable_size(const void* p) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export size_t mi_good_size(size_t size)     mi_attr_noexcept;
 
+mi_decl_export mi_decl_restrict void _df_report_violation()  mi_attr_noexcept;
 
 // ------------------------------------------------------
 // Internals
@@ -293,7 +298,6 @@ typedef enum mi_option_e {
   mi_option_eager_region_commit,
   mi_option_reset_decommits,
   mi_option_large_os_pages,         // implies eager commit
-  mi_option_reserve_huge_os_pages,
   mi_option_segment_cache,
   mi_option_page_reset,
   mi_option_abandoned_page_reset,

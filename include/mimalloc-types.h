@@ -8,12 +8,41 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MIMALLOC_TYPES_H
 #define MIMALLOC_TYPES_H
 
+#include <assert.h>   // static_assert
 #include <stddef.h>   // ptrdiff_t
 #include <stdint.h>   // uintptr_t, uint16_t, etc
 #include <mimalloc-atomic.h>  // _Atomic
 
+#define DF_PTR_BITS  (32U)  // support 16GB as required for SPECspeed 2017
+#define DF_MTAG_BITS (4U)
+#define DF_TOTAL_HEAP_SIZE (1ULL << DF_PTR_BITS)
+#define DF_MAP_SIZE  (1ULL << (DF_PTR_BITS + DF_MTAG_BITS))
+#define DF_TAG_GRANULARITY_SHIFT (4)
+#define DF_TAG_GRANULARITY (1<<DF_TAG_GRANULARITY_SHIFT)
+#define DF_SHADOW_SIZE (1ULL << (DF_PTR_BITS - DF_TAG_GRANULARITY_SHIFT))
+
+#if defined(__linux__)
+typedef union mi_memfd_u {
+  volatile _Atomic(uintptr_t) value;
+  struct {
+    int fd;
+    bool is_init;
+  } x;
+} mi_memfd_t;
+typedef volatile _Atomic(uintptr_t) mi_rage_start_t;
+typedef volatile _Atomic(uintptr_t) mi_shadow_start_t;
+#define DF_MEMFD_NAME    "dfmap"
+#else
+#error "platform not yet supported"
+#endif
+
+static_assert(sizeof(mi_memfd_t) == sizeof(uintptr_t),
+              "mi_memfd_t cannot be read atomically");
+
+
 // Minimal alignment necessary. On most platforms 16 bytes are needed
 // due to SSE registers for example. This must be at least `MI_INTPTR_SIZE`
+//#define MI_MAX_ALIGN_SIZE  32   // sizeof(max_align_t)
 #define MI_MAX_ALIGN_SIZE  16   // sizeof(max_align_t)
 
 // ------------------------------------------------------
@@ -24,7 +53,7 @@ terms of the MIT license. A copy of the license can be found in the file
 // #define NDEBUG
 
 // Define MI_STAT as 1 to maintain statistics; set it to 2 to have detailed statistics (but costs some performance).
-// #define MI_STAT 1
+// #define MI_STAT 2
 
 // Define MI_SECURE to enable security mitigations
 // #define MI_SECURE 1  // guard page around metadata
@@ -207,6 +236,7 @@ typedef struct mi_page_s {
   uint8_t               is_reset:1;        // `true` if the page memory was reset
   uint8_t               is_committed:1;    // `true` if the page virtual memory is committed
   uint8_t               is_zero_init:1;    // `true` if the page was zero initialized
+  uint8_t               df_tag;            // random tag inserted into allocations
 
   // layout like this to optimize access in `mi_malloc` and `mi_free`
   uint16_t              capacity;          // number of blocks committed, must be the first field, see `segment.c:page_clear`
@@ -309,11 +339,10 @@ typedef struct mi_padding_s {
   uint32_t delta;  // padding bytes before the block. (mi_usable_size(p) - delta == exact allocated bytes)
 } mi_padding_t;
 #define MI_PADDING_SIZE   (sizeof(mi_padding_t))
-#define MI_PADDING_WSIZE  ((MI_PADDING_SIZE + MI_INTPTR_SIZE - 1) / MI_INTPTR_SIZE)
 #else
-#define MI_PADDING_SIZE   0
-#define MI_PADDING_WSIZE  0
+#define MI_PADDING_SIZE   1
 #endif
+#define MI_PADDING_WSIZE  ((MI_PADDING_SIZE + MI_INTPTR_SIZE - 1) / MI_INTPTR_SIZE)
 
 #define MI_PAGES_DIRECT   (MI_SMALL_WSIZE_MAX + MI_PADDING_WSIZE + 1)
 

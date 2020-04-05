@@ -10,10 +10,17 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include <string.h>  // memset, memcpy, strlen
 #include <stdlib.h>  // malloc, exit
+#include <unistd.h>    // _exit
 
 #define MI_IN_ALLOC_C
 #include "alloc-override.c"
 #undef MI_IN_ALLOC_C
+
+
+void _df_report_violation() mi_attr_noexcept {
+  __builtin_trap();
+  return;
+}
 
 // ------------------------------------------------------
 // Allocation
@@ -62,16 +69,20 @@ extern inline mi_decl_restrict void* mi_heap_malloc_small(mi_heap_t* heap, size_
   mi_assert(heap!=NULL);
   mi_assert(heap->thread_id == 0 || heap->thread_id == _mi_thread_id()); // heaps are thread local
   mi_assert(size <= MI_SMALL_SIZE_MAX);
-  mi_page_t* page = _mi_heap_get_free_small_page(heap,size + MI_PADDING_SIZE);
-  void* p = _mi_page_malloc(heap, page, size + MI_PADDING_SIZE);
-  mi_assert_internal(p==NULL || mi_usable_size(p) >= size);
+  size_t alloc_size = _mi_align_up(size + MI_PADDING_SIZE, DF_TAG_GRANULARITY);
+
+  mi_page_t* page = _mi_heap_get_free_small_page(heap, alloc_size);
+  void* p = _mi_page_malloc(heap, page, alloc_size);
+  mi_assert_internal(p==NULL || mi_usable_size(p) + MI_PADDING_SIZE >= alloc_size);
   #if MI_STAT>1
   if (p != NULL) {
     if (!mi_heap_is_initialized(heap)) { heap = mi_get_default_heap(); }
     mi_heap_stat_increase(heap, malloc, mi_usable_size(p));
   }
   #endif
-  return p;
+
+  // TODO: avoid call to mi_usable_size
+  return _mi_df_new_allocation(p, _mi_align_up(mi_usable_size(p), DF_TAG_GRANULARITY));
 }
 
 extern inline mi_decl_restrict void* mi_malloc_small(size_t size) mi_attr_noexcept {
@@ -80,13 +91,19 @@ extern inline mi_decl_restrict void* mi_malloc_small(size_t size) mi_attr_noexce
 
 // The main allocation function
 extern inline mi_decl_restrict void* mi_heap_malloc(mi_heap_t* heap, size_t size) mi_attr_noexcept {
-  if (mi_likely(size <= MI_SMALL_SIZE_MAX)) {
-    return mi_heap_malloc_small(heap, size);
+  void* p = NULL;
+
+  if (mi_likely(size <= MI_SMALL_SIZE_MAX - MI_PADDING_SIZE)) {
+    p = mi_heap_malloc_small(heap, size);
   }
   else {
     mi_assert(heap!=NULL);
     mi_assert(heap->thread_id == 0 || heap->thread_id == _mi_thread_id()); // heaps are thread local
-    void* const p = _mi_malloc_generic(heap, size + MI_PADDING_SIZE);      // note: size can overflow but it is detected in malloc_generic
+    p = _mi_malloc_generic(heap, size + MI_PADDING_SIZE);      // note: size can overflow but it is detected in malloc_generic
+    if (p != NULL) {
+      p = _mi_df_new_allocation(p, _mi_align_up(mi_usable_size(p), DF_TAG_GRANULARITY));
+    }
+    mi_assert_internal(p == NULL || mi_usable_size(p) >= size);
     mi_assert_internal(p == NULL || mi_usable_size(p) >= size);
     #if MI_STAT>1
     if (p != NULL) {
@@ -94,8 +111,12 @@ extern inline mi_decl_restrict void* mi_heap_malloc(mi_heap_t* heap, size_t size
       mi_heap_stat_increase(heap, malloc, mi_usable_size(p));
     }
     #endif
-    return p;
   }
+
+  if (p == NULL) {
+    return NULL;
+  }
+  return p;
 }
 
 extern inline mi_decl_restrict void* mi_malloc(size_t size) mi_attr_noexcept {
@@ -133,7 +154,8 @@ mi_decl_restrict void* mi_zalloc_small(size_t size) mi_attr_noexcept {
 void* _mi_heap_malloc_zero(mi_heap_t* heap, size_t size, bool zero) {
   void* p = mi_heap_malloc(heap,size);
   if (zero && p != NULL) {
-    _mi_block_zero_init(_mi_ptr_page(p),p,size);  // todo: can we avoid getting the page again?
+    void* unmasked_ptr = _mi_df_ptr_mask_tag(p);
+    _mi_block_zero_init(_mi_ptr_page(unmasked_ptr), unmasked_ptr, size);  // todo: can we avoid getting the page again?
   }
   return p;
 }
@@ -211,7 +233,8 @@ static size_t mi_page_usable_size_of(const mi_page_t* page, const mi_block_t* bl
   size_t bsize;
   size_t delta;
   bool ok = mi_page_decode_padding(page, block, &delta, &bsize);
-  mi_assert_internal(ok); mi_assert_internal(delta <= bsize);
+  mi_assert_internal(ok);
+  mi_assert_internal(delta <= bsize);
   return (ok ? bsize - delta : 0);
 }
 
@@ -385,6 +408,9 @@ static void mi_decl_noinline mi_free_generic(const mi_segment_t* segment, bool l
 // Free a block
 void mi_free(void* p) mi_attr_noexcept
 {
+  void* to_free = p;
+  p = _mi_df_ptr_mask_tag(p);
+
 #if (MI_DEBUG>0)
   if (mi_unlikely(((uintptr_t)p & (MI_INTPTR_SIZE - 1)) != 0)) {
     _mi_error_message(EINVAL, "trying to free an invalid (unaligned) pointer: %p\n", p);
@@ -410,6 +436,8 @@ void mi_free(void* p) mi_attr_noexcept
     return;
   }
 #endif
+
+  _mi_df_retire_allocation(to_free, mi_usable_size(p));
 
   const uintptr_t tid = _mi_thread_id();
   mi_page_t* const page = _mi_segment_page_of(segment, p);
@@ -470,12 +498,13 @@ bool _mi_free_delayed_block(mi_block_t* block) {
 // Bytes available in a block
 size_t mi_usable_size(const void* p) mi_attr_noexcept {
   if (p==NULL) return 0;
-  const mi_segment_t* const segment = _mi_ptr_segment(p);
-  const mi_page_t* const page = _mi_segment_page_of(segment, p);
-  const mi_block_t* const block = (const mi_block_t*)p;
+  void* _p = _mi_df_ptr_mask_tag(p);
+  const mi_segment_t* const segment = _mi_ptr_segment(_p);
+  const mi_page_t* const page = _mi_segment_page_of(segment, _p);
+  const mi_block_t* const block = (const mi_block_t*)_p;
   const size_t size = mi_page_usable_size_of(page, block);
   if (mi_unlikely(mi_page_has_aligned(page))) {
-    ptrdiff_t const adjust = (uint8_t*)p - (uint8_t*)_mi_page_ptr_unalign(segment,page,p);
+    ptrdiff_t const adjust = (uint8_t*)p - (uint8_t*)_mi_page_ptr_unalign(segment,page,_p);
     mi_assert_internal(adjust >= 0 && (size_t)adjust <= size);
     return (size - adjust);
   }
@@ -483,7 +512,6 @@ size_t mi_usable_size(const void* p) mi_attr_noexcept {
     return size;
   }
 }
-
 
 // ------------------------------------------------------
 // ensure explicit external inline definitions are emitted!
@@ -554,7 +582,8 @@ void* mi_expand(void* p, size_t newsize) mi_attr_noexcept {
 
 void* _mi_heap_realloc_zero(mi_heap_t* heap, void* p, size_t newsize, bool zero) {
   if (p == NULL) return _mi_heap_malloc_zero(heap,newsize,zero);
-  size_t size = mi_usable_size(p);
+  void* unmasked_ptr = _mi_df_ptr_mask_tag(p);
+  size_t size = mi_usable_size(unmasked_ptr);
   if (newsize <= size && newsize >= (size / 2)) {
     return p;  // reallocation still fits and not more than 50% waste
   }

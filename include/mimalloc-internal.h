@@ -10,6 +10,8 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc-types.h"
 
+#include <string.h>    // memset
+
 #if (MI_DEBUG>0)
 #define mi_trace_message(...)  _mi_trace_message(__VA_ARGS__)
 #else
@@ -51,10 +53,14 @@ uintptr_t  _os_random_weak(uintptr_t extra_seed);
 static inline uintptr_t _mi_random_shuffle(uintptr_t x);
 
 // init.c
+extern mi_shadow_start_t _df_shadow_start;
+extern mi_rage_start_t  _df_range_start;
+extern mi_memfd_t       _df_memfd;
 extern mi_stats_t       _mi_stats_main;
 extern const mi_page_t  _mi_page_empty;
 bool       _mi_is_main_thread(void);
 bool       _mi_preloading();  // true while the C runtime is not ready
+mi_heap_t* _mi_heap_main_get(void);    // statically allocated main backing heap
 
 // os.c
 size_t     _mi_os_page_size(void);
@@ -134,6 +140,11 @@ bool        _mi_page_is_valid(mi_page_t* page);
 #endif
 
 
+// forwards declare
+static inline mi_segment_t* _mi_ptr_segment(const void* p);
+static inline mi_page_t* _mi_segment_page_of(const mi_segment_t* segment, const void* p);
+
+
 // ------------------------------------------------------
 // Branches
 // ------------------------------------------------------
@@ -192,6 +203,73 @@ bool        _mi_page_is_valid(mi_page_t* page);
 #define MI_INIT64(x)  MI_INIT32(x),MI_INIT32(x)
 #define MI_INIT128(x) MI_INIT64(x),MI_INIT64(x)
 #define MI_INIT256(x) MI_INIT128(x),MI_INIT128(x)
+
+static inline void* _mi_df_ptr_mask_tag(const void* ptr) {
+  uintptr_t uptr = (uintptr_t)ptr;
+  uintptr_t masked_p = uptr & ~(((1ULL << DF_MTAG_BITS) - 1) << (DF_PTR_BITS));
+  return (void*)masked_p;
+}
+
+static inline uint8_t _mi_df_ptr_get_tag(void* ptr) {
+  uintptr_t uptr = (uintptr_t)ptr;
+  uintptr_t tag = (uptr >> (DF_PTR_BITS));
+  return (uint8_t)tag;
+}
+
+static inline void* _mi_df_ptr_add_tag(void* ptr, uint8_t tag) {
+  uintptr_t uptr = (uintptr_t)ptr;
+  mi_assert_internal(tag < (1 << DF_MTAG_BITS));
+  uintptr_t tagged_p = uptr | ((uintptr_t)tag << (DF_PTR_BITS));
+  return (void*)tagged_p;
+}
+
+static inline uint8_t* _mi_df_ptr_to_shadow(void* ptr) {
+  uintptr_t uptr = (uintptr_t)ptr;
+
+  uintptr_t range_start = mi_atomic_read_relaxed(&_df_range_start);
+  uintptr_t shadow_start = mi_atomic_read_relaxed(&_df_shadow_start);
+  uintptr_t offset = uptr - range_start;
+  return (uint8_t*)(shadow_start + (offset >> DF_TAG_GRANULARITY_SHIFT));
+}
+
+static inline void* _mi_df_new_allocation(void* ptr, size_t size) {
+  if (ptr == NULL) {
+    return NULL;
+  }
+  // random tag
+  //static mi_heap_t* _mi_heap_main = NULL;
+  //if (_mi_heap_main == NULL) {
+  //  _mi_heap_main = _mi_heap_main_get();
+  //}
+  //uint8_t tag = (uint8_t)(_mi_random_next(&_mi_heap_main->random) & ((1 << DF_MTAG_BITS)- 1));
+
+  // generational tag
+  mi_segment_t* segment = _mi_ptr_segment(ptr);
+  mi_page_t* page = _mi_segment_page_of(segment, ptr);
+  uint8_t rand = page->df_tag;
+  uint8_t tag = (uint8_t)(page->df_tag & ((1 << DF_MTAG_BITS)- 1));
+
+  uint8_t* shadow_loc = _mi_df_ptr_to_shadow(ptr);
+  ptr = _mi_df_ptr_add_tag(ptr, tag);
+
+  uint8_t shadow_val = (uint8_t)((uintptr_t)ptr >> (DF_PTR_BITS));
+  memset(shadow_loc, shadow_val, size >> DF_TAG_GRANULARITY_SHIFT);
+  return ptr;
+}
+
+static inline void _mi_df_retire_allocation(void* ptr, size_t size) {
+  uint8_t tag = _mi_df_ptr_get_tag(ptr);
+  ptr = _mi_df_ptr_mask_tag(ptr);
+  uint8_t* shadow_loc = _mi_df_ptr_to_shadow(ptr);
+  uint8_t stag = *shadow_loc;
+  if (tag != stag) {
+    _mi_warning_message("_mi_df_retire_allocation failed\n");
+    __builtin_trap();
+    //_exit(-1);
+  }
+  // invalidate tag
+  *shadow_loc ^= 1;
+}
 
 
 // Is `x` a power of two? (0 is considered a power of two)
@@ -287,7 +365,6 @@ We try to circumvent this in an efficient way:
 
 extern const mi_heap_t _mi_heap_empty;  // read-only empty heap, initial value of the thread local default heap
 extern bool _mi_process_is_initialized;
-mi_heap_t*  _mi_heap_main_get(void);    // statically allocated main backing heap
 
 #if defined(MI_MALLOC_OVERRIDE)
 #if defined(__MACH__) // OSX

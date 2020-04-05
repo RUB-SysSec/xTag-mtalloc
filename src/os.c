@@ -8,6 +8,10 @@ terms of the MIT license. A copy of the license can be found in the file
 #define _DEFAULT_SOURCE   // ensure mmap flags are defined
 #endif
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // ensure memfd_create is defined
+#endif
+
 #include "mimalloc.h"
 #include "mimalloc-internal.h"
 #include "mimalloc-atomic.h"
@@ -22,6 +26,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #else
 #include <sys/mman.h>  // mmap
 #include <unistd.h>    // sysconf
+#include <fcntl.h>     // fallocate
+#include <linux/memfd.h>
 #if defined(__linux__)
 #include <linux/mman.h> // linux mmap flags
 #endif
@@ -35,7 +41,8 @@ terms of the MIT license. A copy of the license can be found in the file
   On windows initializes support for aligned allocation and
   large OS pages (if MIMALLOC_LARGE_OS_PAGES is true).
 ----------------------------------------------------------- */
-bool    _mi_os_decommit(void* addr, size_t size, mi_stats_t* stats);
+bool _mi_os_decommit(void* addr, size_t size, mi_stats_t* stats);
+bool _mi_os_commit(void* addr, size_t size, bool* is_zero, mi_stats_t* stats);
 
 static void* mi_align_up_ptr(void* p, size_t alignment) {
   return (void*)_mi_align_up((uintptr_t)p, alignment);
@@ -152,7 +159,7 @@ void _mi_os_init(void) {
     pNtAllocateVirtualMemoryEx = (PNtAllocateVirtualMemoryEx)(void (*)(void))GetProcAddress(hDll, "NtAllocateVirtualMemoryEx");
     FreeLibrary(hDll);
   }
-  if (mi_option_is_enabled(mi_option_large_os_pages) || mi_option_is_enabled(mi_option_reserve_huge_os_pages)) {
+  if (mi_option_is_enabled(mi_option_large_os_pages)) {
     mi_win_enable_large_os_pages();
   }
 }
@@ -444,12 +451,14 @@ static void* mi_os_mem_alloc(size_t size, size_t try_alignment, bool commit, boo
   */
 
   #if defined(_WIN32)
-    int flags = MEM_RESERVE;
-    if (commit) flags |= MEM_COMMIT;
-    p = mi_win_virtual_alloc(NULL, size, try_alignment, flags, false, allow_large, is_large);
+    //int flags = MEM_RESERVE;
+    //if (commit) flags |= MEM_COMMIT;
+    //p = mi_win_virtual_alloc(NULL, size, try_alignment, flags, false, allow_large, is_large);
+    #error "win32 not yet implemented"
   #elif defined(__wasi__)
-    *is_large = false;
-    p = mi_wasm_heap_grow(size, try_alignment);
+    //*is_large = false;
+    //p = mi_wasm_heap_grow(size, try_alignment);
+    #error "wasi not implemented"
   #else
     int protect_flags = (commit ? (PROT_WRITE | PROT_READ) : PROT_NONE);
     p = mi_unix_mmap(NULL, size, try_alignment, protect_flags, false, allow_large, is_large);
@@ -459,76 +468,6 @@ static void* mi_os_mem_alloc(size_t size, size_t try_alignment, bool commit, boo
     _mi_stat_increase(&stats->reserved, size);
     if (commit) { _mi_stat_increase(&stats->committed, size); }
   }
-  return p;
-}
-
-
-// Primitive aligned allocation from the OS.
-// This function guarantees the allocated memory is aligned.
-static void* mi_os_mem_alloc_aligned(size_t size, size_t alignment, bool commit, bool allow_large, bool* is_large, mi_stats_t* stats) {
-  mi_assert_internal(alignment >= _mi_os_page_size() && ((alignment & (alignment - 1)) == 0));
-  mi_assert_internal(size > 0 && (size % _mi_os_page_size()) == 0);
-  if (!commit) allow_large = false;
-  if (!(alignment >= _mi_os_page_size() && ((alignment & (alignment - 1)) == 0))) return NULL;
-  size = _mi_align_up(size, _mi_os_page_size());
-
-  // try first with a hint (this will be aligned directly on Win 10+ or BSD)
-  void* p = mi_os_mem_alloc(size, alignment, commit, allow_large, is_large, stats);
-  if (p == NULL) return NULL;
-
-  // if not aligned, free it, overallocate, and unmap around it
-  if (((uintptr_t)p % alignment != 0)) {
-    mi_os_mem_free(p, size, commit, stats);
-    if (size >= (SIZE_MAX - alignment)) return NULL; // overflow
-    size_t over_size = size + alignment;
-
-#if _WIN32
-    // over-allocate and than re-allocate exactly at an aligned address in there.
-    // this may fail due to threads allocating at the same time so we
-    // retry this at most 3 times before giving up.
-    // (we can not decommit around the overallocation on Windows, because we can only
-    //  free the original pointer, not one pointing inside the area)
-    int flags = MEM_RESERVE;
-    if (commit) flags |= MEM_COMMIT;
-    for (int tries = 0; tries < 3; tries++) {
-      // over-allocate to determine a virtual memory range
-      p = mi_os_mem_alloc(over_size, alignment, commit, false, is_large, stats);
-      if (p == NULL) return NULL; // error
-      if (((uintptr_t)p % alignment) == 0) {
-        // if p happens to be aligned, just decommit the left-over area
-        _mi_os_decommit((uint8_t*)p + size, over_size - size, stats);
-        break;
-      }
-      else {
-        // otherwise free and allocate at an aligned address in there
-        mi_os_mem_free(p, over_size, commit, stats);
-        void* aligned_p = mi_align_up_ptr(p, alignment);
-        p = mi_win_virtual_alloc(aligned_p, size, alignment, flags, false, allow_large, is_large);
-        if (p == aligned_p) break; // success!
-        if (p != NULL) { // should not happen?
-          mi_os_mem_free(p, size, commit, stats);
-          p = NULL;
-        }
-      }
-    }
-#else
-    // overallocate...
-    p = mi_os_mem_alloc(over_size, alignment, commit, false, is_large, stats);
-    if (p == NULL) return NULL;
-    // and selectively unmap parts around the over-allocated area.
-    void* aligned_p = mi_align_up_ptr(p, alignment);
-    size_t pre_size = (uint8_t*)aligned_p - (uint8_t*)p;
-    size_t mid_size = _mi_align_up(size, _mi_os_page_size());
-    size_t post_size = over_size - pre_size - mid_size;
-    mi_assert_internal(pre_size < over_size && post_size < over_size && mid_size >= size);
-    if (pre_size > 0)  mi_os_mem_free(p, pre_size, commit, stats);
-    if (post_size > 0) mi_os_mem_free((uint8_t*)aligned_p + mid_size, post_size, commit, stats);
-    // we can return the aligned pointer on `mmap` systems
-    p = aligned_p;
-#endif
-  }
-
-  mi_assert_internal(p == NULL || (p != NULL && ((uintptr_t)p % alignment) == 0));
   return p;
 }
 
@@ -553,17 +492,31 @@ void  _mi_os_free(void* p, size_t size, mi_stats_t* stats) {
   _mi_os_free_ex(p, size, true, stats);
 }
 
-void* _mi_os_alloc_aligned(size_t size, size_t alignment, bool commit, bool* large, mi_os_tld_t* tld)
-{
+void* _mi_os_alloc_aligned_from_reserved(void* p, size_t size, size_t alignment, bool commit, bool* large, mi_os_tld_t* tld) {
   if (size == 0) return NULL;
-  size = _mi_os_good_alloc_size(size);
+  size_t good_size = _mi_os_good_alloc_size(size);
+  mi_assert_internal(size == good_size);
   alignment = _mi_align_up(alignment, _mi_os_page_size());
-  bool allow_large = false;
-  if (large != NULL) {
-    allow_large = *large;
-    *large = false;
+  mi_assert_internal(((uintptr_t)p & (alignment - 1)) == 0);
+  *large = false;
+
+  if (commit) {
+    bool is_zero;
+    if(!_mi_os_commit(p, good_size, &is_zero, tld->stats)) {
+      return NULL;
+    }
   }
-  return mi_os_mem_alloc_aligned(size, alignment, commit, allow_large, (large!=NULL?large:&allow_large), tld->stats);
+  else {
+    // as the memory is not commited and PROT_NONE is used there is no
+    // need to allocate in the underlying memfd
+  }
+  return p;
+}
+
+void _mi_os_free_from_reserved(void* p, size_t size, mi_stats_t* stats) {
+  size_t good_size = _mi_os_good_alloc_size(size);
+  mi_assert_internal(size == good_size);
+  _mi_os_decommit(p, good_size, stats);
 }
 
 
@@ -621,6 +574,7 @@ static bool mi_os_commitx(void* addr, size_t size, bool commit, bool conservativ
   int err = 0;
   if (commit) {
     _mi_stat_increase(&stats->committed, csize);
+    _mi_fprintf(NULL, NULL, "new commited %ld\n", stats->committed.current);
     _mi_stat_counter_increase(&stats->commit_calls, 1);
   }
   else {
@@ -641,19 +595,53 @@ static bool mi_os_commitx(void* addr, size_t size, bool commit, bool conservativ
   #elif defined(__wasi__)
   // WebAssembly guests can't control memory protection
   #elif defined(MAP_FIXED)
+
+  mi_memfd_t mi_memfd;
+  mi_memfd.value = mi_atomic_read_relaxed(&_df_memfd.value);
+  mi_assert_internal(mi_memfd.x.is_init);
+  uintptr_t range_start = mi_atomic_read_relaxed(&_df_range_start);
+  size_t offset =   (uintptr_t)start - range_start;
+  size_t offset_e = (uintptr_t)start - range_start;
+  mi_assert_internal((offset & 0xfff) == 0);
+  mi_assert_internal((csize & 0xfff) == 0);
+
   if (!commit) {
-    // use mmap with MAP_FIXED to discard the existing memory (and reduce commit charge)
-    void* p = mmap(start, csize, PROT_NONE, (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE), -1, 0);
-    if (p != start) { err = errno; }
+    for (uintptr_t mtag = 0; mtag < (1ULL << DF_MTAG_BITS); mtag++) {
+      uintptr_t map_p = (uintptr_t)start;
+      map_p |= mtag << (DF_PTR_BITS);
+      const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED;
+      uintptr_t actual = (uintptr_t)mmap((void*)map_p, csize, PROT_NONE, flags, -1, 0);
+      if (actual != map_p) {
+        // TODO error handling
+        err = errno;
+        _exit(-1);
+      }
+    }
+
+    _mi_fprintf(NULL, NULL, "freeing %zu\n", csize);
+    fallocate(mi_memfd.x.fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, offset, csize);
   }
   else {
-    // for commit, just change the protection
-    err = mprotect(start, csize, (PROT_READ | PROT_WRITE));
-    if (err != 0) { err = errno; }
+    fallocate(mi_memfd.x.fd, FALLOC_FL_KEEP_SIZE, offset, csize);
+    mi_stat_counter_increase(stats->mmap_calls, (1 << DF_MTAG_BITS));
+
+    for (uintptr_t mtag = 0; mtag < (1ULL << DF_MTAG_BITS); mtag++) {
+      uintptr_t map_p = (uintptr_t)start;
+      map_p |= mtag << (DF_PTR_BITS);
+
+      const int flags = MAP_SHARED | MAP_FIXED | MAP_POPULATE;
+      uintptr_t actual = (uintptr_t)mmap((void*)map_p, csize, PROT_WRITE | PROT_READ, flags, mi_memfd.x.fd, offset);
+
+      mi_assert_internal(actual == map_p);
+      if (actual != map_p) {
+        err = errno;
+        _mi_fprintf(NULL, NULL, "actual %p map_p %p error %d\n", actual, map_p, err);
+        _exit(-1);
+      }
+    }
   }
   #else
-  err = mprotect(start, csize, (commit ? (PROT_READ | PROT_WRITE) : PROT_NONE));
-  if (err != 0) { err = errno; }
+  #error "need MAP_FIXED"
   #endif
   if (err != 0) {
     _mi_warning_message("%s error: start: %p, csize: 0x%x, err: %i\n", commit ? "commit" : "decommit", start, csize, err);
@@ -681,6 +669,9 @@ bool _mi_os_commit_unreset(void* addr, size_t size, bool* is_zero, mi_stats_t* s
 // pages and reduce swapping while keeping the memory committed.
 // We page align to a conservative area inside the range to reset.
 static bool mi_os_resetx(void* addr, size_t size, bool reset, mi_stats_t* stats) {
+  // memfd has no support for resetting, hence we shouldn't hit this path ATM.
+  mi_assert_internal(0);
+
   // page align conservatively within the range
   size_t csize;
   void* start = mi_os_page_align_area_conservative(addr, size, &csize);
@@ -1077,3 +1068,94 @@ int _mi_os_numa_node_get(mi_os_tld_t* tld) {
   if (numa_node >= numa_count) { numa_node = numa_node % numa_count; }
   return (int)numa_node;
 }
+
+#if defined(__linux__)
+uintptr_t _mi_os_reserve_df_range() {
+  const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+  uintptr_t p = (uintptr_t)mmap(NULL, DF_MAP_SIZE, PROT_NONE, flags, -1, 0);
+  if (!p) {
+    return 0;
+  }
+  if (p % DF_MAP_SIZE != 0) {
+    // we have a mapping but it is not properly aligned
+    munmap((void*)p, DF_MAP_SIZE);
+    p = (uintptr_t)mmap(NULL, DF_MAP_SIZE * 2, PROT_NONE, flags, -1, 0);
+    if (!p) {
+      return 0;
+    }
+    uintptr_t aligned_p = _mi_align_up(p, DF_MAP_SIZE);
+    uint64_t slack = aligned_p - p;
+    if (slack) {
+      munmap((void*)p, slack);
+    }
+    slack = DF_MAP_SIZE - slack;
+    if (slack) {
+      munmap((void*)(aligned_p + DF_MAP_SIZE), slack);
+    }
+
+    p = aligned_p;
+  }
+
+  return p;
+}
+
+bool _mi_os_delete_df_range(uintptr_t ptr) {
+  bool err = (munmap((void*)ptr, DF_MAP_SIZE) == -1);
+  return err;
+}
+
+#else
+#error "no support for other os implemented"
+#endif
+
+#if defined(__linux__)
+bool _mi_os_create_memfd(mi_memfd_t* _mi_memfd) {
+
+  int flags = MFD_CLOEXEC;
+  flags |= (MFD_HUGETLB | MFD_HUGE_2MB);
+
+  int memfd = memfd_create(DF_MEMFD_NAME, flags);
+  if (memfd == -1) {
+    return false;
+  }
+  int err = ftruncate(memfd, DF_TOTAL_HEAP_SIZE);
+  if (err) {
+    close(memfd);
+    return false;
+  }
+  _mi_memfd->x.fd = memfd;
+  _mi_memfd->x.is_init = true;
+  return true;
+}
+
+void _mi_os_close_memfd(mi_memfd_t* _mi_memfd) {
+  //close(_mi_memfd->x.fd);
+  _mi_fprintf(NULL, NULL, "closing %d\n", close(_mi_memfd->x.fd));
+}
+
+
+void* _mi_os_reserve_shadow() {
+  const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+
+  // the magic_const is computed such that the shadow pointer can be used
+  // as input for a shrx instruction extracting the shadow offset.
+  const uintptr_t magic_const = 64 - DF_PTR_BITS + DF_TAG_GRANULARITY_SHIFT;
+
+  uintptr_t shadow = (uintptr_t)mmap(NULL, DF_SHADOW_SIZE + 0x10000, PROT_READ | PROT_WRITE, flags, -1, 0);
+  if (shadow) {
+    madvise((void*)shadow, DF_SHADOW_SIZE + 0x10000, MADV_HUGEPAGE);
+    // round up to 0x10000 so the lowest 2 bytes are 0000
+    shadow = (shadow + 0x10000 - 1) / 0x10000 * 0x10000;
+    return (void*)(shadow + magic_const);
+  }
+  else {
+    return NULL;
+  }
+}
+
+void _mi_os_delete_shadow(void* ptr) {
+  munmap((char*)ptr - 4, DF_SHADOW_SIZE);
+}
+#else
+#error "no support for other os implemented"
+#endif

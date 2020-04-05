@@ -581,6 +581,9 @@ static mi_segment_t* mi_segment_init(mi_segment_t* segment, size_t required, mi_
   const bool eager_delayed = (page_kind <= MI_PAGE_MEDIUM && tld->count < (size_t)mi_option_get(mi_option_eager_commit_delay));
   const bool eager  = !eager_delayed && mi_option_is_enabled(mi_option_eager_commit);
   bool commit = eager; // || (page_kind >= MI_PAGE_LARGE);
+  mi_assert_internal(!eager_delayed);
+  mi_assert_internal(eager);
+  mi_assert_internal(commit);
   bool pages_still_good = false;
   bool is_zero = false;
 
@@ -621,7 +624,7 @@ static mi_segment_t* mi_segment_init(mi_segment_t* segment, size_t required, mi_
   else {
     // Allocate the segment from the OS
     size_t memid;
-    bool   mem_large = (!eager_delayed && (MI_SECURE==0)); // only allow large OS pages once we are no longer lazy
+    bool   mem_large = (!eager_delayed && (MI_SECURE==0) && mi_option_is_enabled(mi_option_large_os_pages)); // only allow large OS pages once we are no longer lazy
     segment = (mi_segment_t*)_mi_mem_alloc_aligned(segment_size, MI_SEGMENT_SIZE, &commit, &mem_large, &is_zero, &memid, os_tld);
     if (segment == NULL) return NULL;  // failed to allocate
     if (!commit) {
